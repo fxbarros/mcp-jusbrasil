@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Backups / cruft de edição
+*.bak
+*.save
+
+# Screenshots de debug (podem expor conta logada)
+screenshots/
+
+# Perfis de navegador e sessões (caso alguém os mova pra cá)
+*.mcp-jusbrasil-*-profile/
+*-session.json
