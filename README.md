@@ -58,4 +58,4 @@ O JusBrasil é um **agregador privado**, não é fonte oficial. Para citação f
 
 ## Licença
 
-Uso pessoal/educacional.
+[MIT](LICENSE).
