@@ -1,14 +1,17 @@
-"""Cliente JusBrasil via Scrapling (StealthyFetcher headless, sem login).
+"""Cliente JusBrasil via Scrapling (StealthyFetcher) — autenticado, headless.
 
-Migrado de patchright (login 2-etapas + sessao persistente + Chrome headed off-screen)
-para o StealthyFetcher do Scrapling:
-  - passa o Cloudflare em HEADLESS puro (validado: 4/4 com perfil limpo);
-  - dispensa login — relator real vem do campo `chairman` do Apollo e o CNJ real
-    de `enrichedContents...informacoes_gerais.numero_processo` (ver _cnj_real_do_apollo),
-    ambos NAO mascarados mesmo anonimo.
+Migrado de patchright para o StealthyFetcher do Scrapling, que passa o Cloudflare
+em HEADLESS puro. Mantém o login com credenciais (Keychain) para acessar o
+INTEIRO TEOR das decisões — capacidade central do projeto.
 
-O PARSER (_parse_decisao / _parse_next_data / _parse_resultados / Decisao / citacao_abnt)
-foi preservado verbatim — a migracao troca apenas como o HTML chega.
+Tools cobertas:
+  - buscar_jurisprudencia / ler_decisao  (metadados + ementa)
+  - ler_inteiro_teor                     (texto integral do acórdão; exige login)
+
+O login é automático e idempotente: se a sessão persistente já estiver válida,
+pula o login; senão, preenche o formulário (2 etapas) com as credenciais do
+Keychain. Sem credenciais, opera anônimo (números podem vir mascarados; o
+inteiro teor fica indisponível).
 """
 from __future__ import annotations
 
@@ -20,12 +23,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
+import keyring
 from bs4 import BeautifulSoup
 from scrapling.fetchers import StealthyFetcher
 
+SERVICO = "mcp-jusbrasil"
 URL_BASE = "https://www.jusbrasil.com.br"
+URL_LOGIN = f"{URL_BASE}/login"
 URL_BUSCA = f"{URL_BASE}/jurisprudencia/busca"
-# Perfil persistente proprio (cookies cf_clearance reaproveitados entre chamadas)
 USER_DATA_DIR = Path.home() / ".mcp-jusbrasil-scrapling-profile"
 
 
@@ -121,6 +126,18 @@ class Decisao:
         return f"({', '.join([head] + extras)})"
 
 
+@dataclass
+class InteiroTeor:
+    """Texto integral de uma decisao (relatorio + voto + acordao)."""
+    url: str
+    url_inteiro_teor: Optional[str]
+    texto: Optional[str]
+    n_caracteres: int
+    autenticado: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
 
 def formatar_cnj(numero_raw):
     """Converte numero cru em formato CNJ.
@@ -158,94 +175,198 @@ _NOMES_EXTENSOS = {
 
 
 def _normalizar_tribunal(tribunal: str) -> str:
-    """Converte qualquer jeito que o usuario escreva num slug do JusBrasil.
-
-    Exemplos:
-      "TJPI"  -> "tj_pi"
-      "TJ-PI" -> "tj_pi"
-      "tj pi" -> "tj_pi"
-      "STF"   -> "stf"
-      "Tribunal de Justiça do Piauí" -> "tj_pi"
-    """
+    """Converte qualquer jeito que o usuario escreva num slug do JusBrasil."""
     import unicodedata
     if not tribunal:
         return ""
-    # Normaliza acentos e caixa (o mapa acima esta sem acento)
     raw = unicodedata.normalize("NFKD", tribunal).encode("ascii", "ignore").decode().lower().strip()
-    # Nome extenso conhecido?
     if raw in _NOMES_EXTENSOS:
         return _NOMES_EXTENSOS[raw]
-    # Tira separadores
     t = re.sub(r"[\s\-.]+", "", tribunal.upper())
-    # Siglas especiais (STF, STJ, TST, etc.)
     if t in _SIGLAS_ESPECIAIS:
         return t.lower()
-    # Padroes TJ-XX, TRF-X, TRT-X, TRE-XX, TJM-XX, TCE-XX
     m = re.match(r"^(TJ|TRF|TRT|TRE|TJM|TCE)([A-Z0-9]+)$", t)
     if m:
         return f"{m.group(1).lower()}_{m.group(2).lower()}"
-    # Fallback: retorna lower sem pontuacao
     return re.sub(r"[\s\-.]+", "_", tribunal.lower())
 
 
-class JusBrasilClient:
-    """Fetch via Scrapling StealthyFetcher (headless, sem login); parser preservado.
+def _strip_acentos(s: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
 
-    Mesma interface da versao patchright (start/close/buscar/ler) para o server.py
-    continuar funcionando sem mudancas. start()/close() viraram no-op porque o
-    StealthyFetcher gerencia o proprio navegador a cada chamada.
+
+def _norm_tribunal_filtro(tribunal: str) -> str:
+    """Valor do filtro `tribunal` (sigla minuscula). Aceita virgula p/ varios.
+    Ex.: "STJ" -> "stj"; "STJ, STF" -> "stj,stf"; "TJs" -> "tjs".
+    """
+    raw = _strip_acentos(tribunal).lower().strip()
+    if "," in raw:
+        return ",".join(_norm_tribunal_filtro(t) for t in raw.split(",") if t.strip())
+    return re.sub(r"\s+", "", raw)
+
+
+_JURIS_TYPES = {
+    "acordao": "acordao", "acordaos": "acordao",
+    "sumula": "sumula", "sumulas": "sumula",
+    "decisao": "decisao", "decisaomonocratica": "decisao", "monocratica": "decisao",
+    "sentenca": "sentenca", "sentencas": "sentenca",
+    "despacho": "despacho", "despachos": "despacho",
+    "orientacao": "orientacao", "orientacaojurisprudencial": "orientacao",
+}
+
+
+def _map_juris_type(tipo: str) -> Optional[str]:
+    k = re.sub(r"\W", "", _strip_acentos(tipo).lower())
+    return _JURIS_TYPES.get(k)
+
+
+def _map_periodo(periodo: str) -> Optional[str]:
+    """Valor do filtro de periodo `l` (ex.: "365dias"). Aceita apelidos e n de dias."""
+    p = re.sub(r"\s+", "", _strip_acentos(str(periodo)).lower())
+    apelidos = {
+        "ultimasemana": "7dias", "semana": "7dias",
+        "ultimomes": "30dias", "mes": "30dias",
+        "ultimoano": "365dias", "ano": "365dias", "1ano": "365dias", "ultimos12meses": "365dias",
+    }
+    if p in apelidos:
+        return apelidos[p]
+    if re.fullmatch(r"\d+dias", p):
+        return p
+    m = re.fullmatch(r"(\d+)(?:d|dia|dias)?", p)
+    return f"{m.group(1)}dias" if m else None
+
+
+class JusBrasilClient:
+    """Fetch via Scrapling StealthyFetcher; login automatico por credenciais.
+
+    Mantem a interface async (start/close/buscar/ler) do server.py. start()/close()
+    sao no-op (o StealthyFetcher gerencia o proprio navegador por chamada).
     """
 
     def __init__(self, headless: bool = True, timeout_ms: int = 60_000):
         self.headless = headless
-        self.timeout_ms = max(timeout_ms, 60_000)  # solve_cloudflare precisa de folga
+        self.timeout_ms = max(timeout_ms, 60_000)
+        self._logged_in = False
+        self._login_lock = asyncio.Lock()
+        self.email = keyring.get_password(SERVICO, "email")
+        self.senha = keyring.get_password(SERVICO, "senha")
         USER_DATA_DIR.mkdir(exist_ok=True)
 
     async def start(self) -> None:
-        return  # Scrapling lanca o navegador por fetch; nada a iniciar
+        return  # Scrapling lanca o navegador por fetch
 
     async def close(self) -> None:
-        return  # nada persistente a fechar
+        return
 
-    def _fetch_kwargs(self) -> dict:
-        return dict(
+    def _fetch_kwargs(self, page_action=None) -> dict:
+        kw = dict(
             headless=self.headless,
-            real_chrome=True,           # usa o Chrome real do sistema (mais furtivo)
-            solve_cloudflare=True,      # resolve Turnstile/Interstitial se aparecer
+            real_chrome=True,
+            solve_cloudflare=True,
             user_data_dir=str(USER_DATA_DIR),
             network_idle=True,
-            google_search=True,         # referer = google (menos anomalo)
+            google_search=True,
             timeout=self.timeout_ms,
         )
+        if page_action is not None:
+            kw["page_action"] = page_action
+        return kw
 
-    async def _fetch_html(self, url: str) -> str:
-        # StealthyFetcher.fetch eh sincrono -> roda em thread pra nao travar o event loop
+    # ---------- Login ----------
+
+    def _login_action(self, page):
+        """Roda DENTRO do navegador (page_action sincrono). Idempotente:
+        se a sessao persistente ja redirecionou pra fora de /login, nao faz nada."""
+        page.wait_for_timeout(2500)
+        if "/login" not in (page.url or "").lower():
+            print("[LOGIN] sessao persistente valida — pulando login")
+            return
+        for sel in ['button:has-text("Aceitar cookies")', 'button:has-text("Aceitar todos")',
+                    'button:has-text("Concordar")']:
+            try:
+                b = page.locator(sel).first
+                if b.is_visible(timeout=600):
+                    b.click(timeout=1200)
+                    break
+            except Exception:
+                pass
+        try:
+            print("[LOGIN 1/2] email...")
+            page.locator('input[type="email"]').first.fill(self.email, timeout=8000)
+            page.locator('button[type="submit"]').first.click(timeout=4000)
+            page.wait_for_timeout(4500)
+            print("[LOGIN 2/2] senha...")
+            page.locator('input[type="password"]').first.fill(self.senha, timeout=12000)
+            page.locator('button[type="submit"]').first.click(timeout=4000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=25000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3000)
+            print(f"[LOGIN] apos submit -> {page.url}")
+        except Exception as e:
+            print(f"[LOGIN] aviso durante login: {e}")
+
+    async def _ensure_login(self) -> bool:
+        """Garante sessao autenticada (uma vez por processo). Sem credenciais: anonimo."""
+        if self._logged_in:
+            return True
+        if not (self.email and self.senha):
+            return False
+        async with self._login_lock:
+            if self._logged_in:
+                return True
+            print("[LOGIN] autenticando no JusBrasil...")
+            await asyncio.to_thread(
+                StealthyFetcher.fetch, URL_LOGIN, **self._fetch_kwargs(page_action=self._login_action)
+            )
+            self._logged_in = True
+            return True
+
+    async def _fetch_html(self, url: str, autenticar: bool = True) -> str:
+        if autenticar:
+            await self._ensure_login()
         page = await asyncio.to_thread(StealthyFetcher.fetch, url, **self._fetch_kwargs())
         return page.html_content
+
+    # ---------- Busca ----------
 
     async def buscar_jurisprudencia(
         self,
         query: str,
         limite: int = 10,
         tribunal: Optional[str] = None,
-        data_inicio: Optional[str] = None,
-        data_fim: Optional[str] = None,
+        tipo: Optional[str] = None,
+        periodo: Optional[str] = None,
+        ordenacao: Optional[str] = None,
     ) -> list[Resultado]:
         if not query or not query.strip():
             raise ValueError("query vazia")
-
-        params = [f"q={quote_plus(query)}"]
-        if tribunal:
-            params.append(f"tribunal={quote_plus(_normalizar_tribunal(tribunal))}")
-        if data_inicio:
-            params.append(f"data_inicial={quote_plus(data_inicio)}")
-        if data_fim:
-            params.append(f"data_final={quote_plus(data_fim)}")
-        url = f"{URL_BUSCA}?{'&'.join(params)}"
-
+        url = self._montar_url_busca(query, tribunal, tipo, periodo, ordenacao)
         print(f"[BUSCA] {url}")
         html = await self._fetch_html(url)
         return self._parse_resultados(html, limite)
+
+    @staticmethod
+    def _montar_url_busca(query, tribunal=None, tipo=None, periodo=None, ordenacao=None,
+                          juris_type_forcado=None) -> str:
+        """Monta a URL de busca com os filtros REAIS do JusBrasil (descobertos via UI).
+        tribunal=<sigla minuscula> (stf/stj/tst/tjs/...); jurisType=<tipo>; l=<N>dias; o=data.
+        """
+        params = [f"q={quote_plus(query)}"]
+        if tribunal:
+            params.append(f"tribunal={quote_plus(_norm_tribunal_filtro(tribunal))}")
+        jt = juris_type_forcado or (_map_juris_type(tipo) if tipo else None)
+        if jt:
+            params.append(f"jurisType={jt}")
+        if periodo:
+            l = _map_periodo(periodo)
+            if l:
+                params.append(f"l={l}")
+        if ordenacao and re.sub(r"\W", "", ordenacao.lower()) in ("data", "recente", "recentes", "maisrecentes"):
+            params.append("o=data")
+        return f"{URL_BUSCA}?{'&'.join(params)}"
 
     def _parse_resultados(self, html: str, limite: int) -> list[Resultado]:
         soup = BeautifulSoup(html, "html.parser")
@@ -267,7 +388,6 @@ class JusBrasilClient:
                     continue
                 vistos.add(href)
                 titulo = self._first_text(node, ["h2", "h3", "h4", "a"]) or "(sem titulo)"
-                # Extrai tribunal do prefixo do titulo: "STF - ...", "TJ-RJ - ...", etc.
                 import re as _re
                 m = _re.match(r"^([A-Z][A-Z0-9-]{1,8}(?:\s*[A-Z0-9-]+)?)\s*[-–]", titulo)
                 tribunal = m.group(1).strip() if m else self._first_text(node, [".tribunal", "span.source"])
@@ -291,6 +411,21 @@ class JusBrasilClient:
                 continue
         return resultados
 
+    # ---------- Sumulas ----------
+
+    async def buscar_sumulas(
+        self, query: str, limite: int = 10, tribunal: Optional[str] = None
+    ) -> list[Resultado]:
+        """Busca sumulas no JusBrasil usando o filtro real jurisType=sumula."""
+        if not query or not query.strip():
+            raise ValueError("query vazia")
+        url = self._montar_url_busca(query, tribunal=tribunal, juris_type_forcado="sumula")
+        print(f"[SUMULA] {url}")
+        html = await self._fetch_html(url)
+        return self._parse_resultados(html, limite)
+
+    # ---------- Decisao ----------
+
     async def ler_decisao(self, url: str):
         """Abre pagina de decisao e extrai todos os metadados."""
         if not url or "jusbrasil.com.br" not in url:
@@ -298,15 +433,165 @@ class JusBrasilClient:
         print(f"[LER] {url}")
         html = await self._fetch_html(url)
         dec = self._parse_decisao(html, url)
-        # Anonimo: se o decisionLabel veio mascarado (XXXXX), recupera o CNJ real do Apollo
         if not dec.numero_cnj:
             real = self._cnj_real_do_apollo(html)
             if real:
                 dec.numero_cnj = real
         return dec
 
+    # ---------- Dossie ----------
+
+    async def compilar_dossie(
+        self,
+        urls: list[str],
+        incluir_inteiro_teor: bool = False,
+        titulo: Optional[str] = None,
+        caminho: Optional[str] = None,
+    ) -> dict:
+        """Compila varias decisoes/sumulas num unico documento .docx."""
+        if not urls:
+            raise ValueError("lista de urls vazia")
+        titulo = titulo or "Dossiê de Jurisprudência"
+        itens = []
+        for u in urls:
+            try:
+                d = await self.ler_decisao(u)
+            except Exception as e:
+                itens.append({"url": u, "erro": str(e)[:150]})
+                continue
+            teor = None
+            if incluir_inteiro_teor:
+                try:
+                    teor = (await self.ler_inteiro_teor(u)).texto
+                except Exception:
+                    teor = None
+            itens.append({"url": u, "decisao": d, "inteiro_teor": teor})
+        arquivo = self._gerar_docx(titulo, itens, caminho)
+        return {
+            "arquivo": arquivo,
+            "n_itens": sum(1 for i in itens if "decisao" in i),
+            "n_falhas": sum(1 for i in itens if "erro" in i),
+            "com_inteiro_teor": bool(incluir_inteiro_teor),
+        }
+
+    @staticmethod
+    def _gerar_docx(titulo: str, itens: list[dict], caminho: Optional[str]) -> str:
+        from datetime import datetime
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        doc = Document()
+        normal = doc.styles["Normal"]
+        normal.font.name = "Times New Roman"
+        normal.font.size = Pt(12)
+
+        doc.add_heading(titulo, level=0)
+        meta = doc.add_paragraph(
+            f"Gerado em {datetime.now():%d/%m/%Y %H:%M} · {len(itens)} item(ns) · "
+            "Fonte: JusBrasil (agregador privado; confira no site oficial do tribunal)."
+        )
+        meta.runs[0].italic = True
+
+        for i, item in enumerate(itens, 1):
+            if "erro" in item:
+                doc.add_heading(f"{i}. (falha ao ler)", level=1)
+                doc.add_paragraph(item["url"])
+                doc.add_paragraph(f"Erro: {item['erro']}")
+                continue
+            d = item["decisao"]
+            cab = " ".join(x for x in [d.tribunal, d.tipo] if x) or "Decisão"
+            doc.add_heading(f"{i}. {cab}", level=1)
+            cit = d.citacao_abnt()
+            if cit:
+                p = doc.add_paragraph()
+                p.add_run(cit).italic = True
+            if d.ementa:
+                doc.add_heading("Ementa", level=2)
+                pe = doc.add_paragraph(d.ementa)
+                pe.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            if item.get("inteiro_teor"):
+                doc.add_heading("Inteiro teor", level=2)
+                for par in re.split(r"\n{2,}", item["inteiro_teor"]):
+                    par = par.strip()
+                    if par:
+                        pp = doc.add_paragraph(par)
+                        pp.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            link = d.url or item["url"]
+            pl = doc.add_paragraph()
+            pl.add_run("Verificar autenticidade: ").bold = True
+            pl.add_run(link)
+
+        if not caminho:
+            import unicodedata
+            base = unicodedata.normalize("NFKD", titulo).encode("ascii", "ignore").decode().lower()
+            slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")[:40] or "dossie"
+            caminho = str(Path.home() / "Downloads" / f"{slug}-{datetime.now():%Y%m%d-%H%M}.docx")
+        Path(caminho).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(Path(caminho).expanduser()))
+        return str(Path(caminho).expanduser())
+
+    # ---------- Inteiro teor ----------
+
+    async def ler_inteiro_teor(self, url: str) -> InteiroTeor:
+        """Extrai o TEXTO INTEGRAL de uma decisao (relatorio+voto+acordao).
+
+        Aceita a URL da decisao OU a URL direta de inteiro teor. Exige login
+        (credenciais no Keychain) — sem sessao autenticada o conteudo nao vem.
+        """
+        if not url or "jusbrasil.com.br" not in url:
+            raise ValueError(f"URL invalida: {url}")
+        autenticado = await self._ensure_login()
+
+        url_teor = url
+        if "/inteiro-teor-" not in url:
+            print(f"[TEOR] localizando inteiro teor a partir da decisao: {url}")
+            html_dec = await self._fetch_html(url)
+            url_teor = self._achar_url_inteiro_teor(html_dec, url)
+            if not url_teor:
+                return InteiroTeor(url=url, url_inteiro_teor=None, texto=None,
+                                   n_caracteres=0, autenticado=autenticado)
+
+        print(f"[TEOR] {url_teor}")
+        html_teor = await self._fetch_html(url_teor)
+        texto = self._extrair_inteiro_teor(html_teor)
+        return InteiroTeor(
+            url=url, url_inteiro_teor=url_teor, texto=texto,
+            n_caracteres=len(texto or ""), autenticado=autenticado,
+        )
+
+    @staticmethod
+    def _achar_url_inteiro_teor(html_decisao: str, url_decisao: str) -> Optional[str]:
+        m = re.search(r'https://www\.jusbrasil\.com\.br/jurisprudencia/[a-z0-9_-]+/\d+/inteiro-teor-\d+',
+                      html_decisao)
+        if m:
+            return m.group(0)
+        m = re.search(r'(/jurisprudencia/[a-z0-9_-]+/\d+/inteiro-teor-\d+)', html_decisao)
+        if m:
+            return f"{URL_BASE}{m.group(1)}"
+        m = re.search(r'/inteiro-teor-\d+', html_decisao)
+        if m:
+            return url_decisao.rstrip("/") + m.group(0)
+        return None
+
+    @staticmethod
+    def _extrair_inteiro_teor(html: str) -> Optional[str]:
+        """Texto integral fica no campo decisionHtml do no INTEIRO_TEOR do Apollo."""
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.S)
+        if not m:
+            return None
+        try:
+            apollo = json.loads(m.group(1)).get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
+        except json.JSONDecodeError:
+            return None
+        for k, v in apollo.items():
+            if k.startswith("Document:") and isinstance(v, dict) and v.get("decisionHtml"):
+                texto = BeautifulSoup(v["decisionHtml"], "html.parser").get_text("\n", strip=True)
+                texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
+                return texto or None
+        return None
+
     def _parse_next_data(self, html: str) -> Optional[dict]:
-        """Extrai o no Document do __NEXT_DATA__ do JusBrasil."""
         m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.S)
         if not m:
             return None
@@ -321,18 +606,14 @@ class JusBrasilClient:
         return None
 
     def _cnj_real_do_apollo(self, html: str) -> Optional[str]:
-        """CNJ real (informacoes_gerais.numero_processo) p/ quando decisionLabel vem mascarado.
-
-        Disponivel mesmo para usuario anonimo — contorna o mascaramento (XXXXX) sem login.
-        """
+        """CNJ real (informacoes_gerais.numero_processo) p/ quando decisionLabel vem mascarado."""
         m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.S)
         if not m:
             return None
         try:
-            data = json.loads(m.group(1))
+            apollo = json.loads(m.group(1)).get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
         except json.JSONDecodeError:
             return None
-        apollo = data.get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
         for key, val in apollo.items():
             if not (key.startswith("Document:") and isinstance(val, dict)):
                 continue
@@ -359,7 +640,6 @@ class JusBrasilClient:
             v = re.sub(r"[\s,;\.·]+$", "", v)
             return v or None
 
-        # Titulo
         titulo = None
         h1 = soup.find(["h1", "h2"])
         if h1:
@@ -369,15 +649,12 @@ class JusBrasilClient:
             if og and og.get("content"):
                 titulo = og["content"].strip()
 
-        # Tribunal: extrai do PATH da URL (mais confiavel)
         tribunal = None
         m_trib = re.search(r"/jurisprudencia/([a-z0-9_-]+)/", url)
         if m_trib:
             slug = m_trib.group(1)
-            # tj_pi -> TJ-PI ; stf -> STF ; trf_1 -> TRF-1
             tribunal = slug.upper().replace("_", "-")
 
-        # Tipo de julgado (aceita c e c-cedilha, a e a-til, i e i-agudo)
         tipo = extrair(
             r"(Apela(?:c|ç)(?:a|ã)o C(?:i|í)vel|Apela(?:c|ç)(?:a|ã)o"
             r"|Recurso Especial|Recurso Extraordin(?:a|á)rio|Habeas Corpus"
@@ -387,7 +664,6 @@ class JusBrasilClient:
             titulo or text
         )
 
-        # FAST PATH: extrai via __NEXT_DATA__ (JSON estruturado, mais robusto)
         nd = self._parse_next_data(html)
         if nd:
             from datetime import datetime
@@ -428,28 +704,23 @@ class JusBrasilClient:
                 ementa=ementa_nd,
             )
 
-        # Numero CNJ: primeiro tenta formatado no texto
         numero_cnj = extrair(r"(\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4})")
         if not numero_cnj:
             mraw = re.search(r"(\d{19,20})", text)
             if mraw:
                 numero_cnj = formatar_cnj(mraw.group(1))
 
-        # Relator: o JusBrasil usa "Relator · Nome" (ponto central)
-        # Aceita tambem ":" e "." tradicionais
         relator = extrair(
             r"Relator(?:a)?[\s·:\.]+([A-Z][A-Za-zÀ-ſ\s\.]{3,80}?)"
             r"(?=\s+(?:Julgado|Data|Órg|Org|C(?:a|â)mara|Ementa)|$)"
         )
 
-        # Data de julgamento: site usa "Julgado em DD/MM/YYYY"
         data_julgamento = extrair(r"Julgado em (\d{1,2}/\d{1,2}/\d{2,4})")
         if not data_julgamento:
             data_julgamento = extrair(r"Data de Julgamento[:\s]+(\d{1,2}/\d{1,2}/\d{2,4})")
 
         data_publicacao = extrair(r"(?:Publicado em|Data de Publica(?:c|ç)(?:a|ã)o)[:\s]+(\d{1,2}/\d{1,2}/\d{2,4})")
 
-        # Orgao julgador: ate a palavra Relator (parada)
         orgao = extrair(
             r"(\d+(?:ª|a)\s+(?:C(?:a|â)mara|Turma)[^·\n]*?)"
             r"(?=\s+Relator|\s+Julgado|$)"
@@ -460,8 +731,6 @@ class JusBrasilClient:
                 r"(?=\s+Relator|\s+Julgado|\s+Data|Ementa|$)"
             )
 
-        # Ementa: a REAL comeca com palavra de cabecalho (APELACAO, RECURSO, etc.)
-        # Isso evita pegar "Ementa para citacao" ou "Ementa Mostrar mais"
         ementa = None
         m_em = re.search(
             r"Ementa[:\s]+"
@@ -491,7 +760,6 @@ class JusBrasilClient:
 
 
 def _title_case_pt(name: str) -> str:
-    """Title case respeitando preposicoes em portugues (do, da, de, dos, das, e)."""
     out = name.title()
     for word in [" Do ", " Da ", " De ", " Dos ", " Das ", " E "]:
         out = out.replace(word, word.lower())
@@ -499,7 +767,6 @@ def _title_case_pt(name: str) -> str:
 
 
 def _orgao_stj_extenso(orgao: str) -> str:
-    """Mapeia 'T4 - QUARTA TURMA' para 'Quarta Turma'."""
     m = re.match(r"^(T[1-6]|S[1-3]|CE)\s*-\s*(.+)$", orgao or "", re.I)
     if m:
         return m.group(2).title()

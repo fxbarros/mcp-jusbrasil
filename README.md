@@ -1,38 +1,37 @@
 # jusbrasil-mcp
 
-Servidor [MCP](https://modelcontextprotocol.io) para pesquisar **jurisprudência no [JusBrasil](https://www.jusbrasil.com.br)** em linguagem natural e devolver **citações já formatadas** para uso em peças jurídicas. Pensado para uso no Claude Desktop.
+Servidor [MCP](https://modelcontextprotocol.io) para pesquisar **jurisprudência no [JusBrasil](https://www.jusbrasil.com.br)** em linguagem natural, ler o **inteiro teor** das decisões e gerar **citações e dossiês** prontos para uso em peças jurídicas. Pensado para o Claude Desktop.
 
-## O que faz
+## Tools
 
-Expõe duas tools:
-
-- **`buscar_jurisprudencia(query, limite, tribunal, data_inicio, data_fim)`** — busca por termos livres; retorna título, tribunal, número CNJ, ementa curta e URL de cada acórdão.
-- **`ler_decisao(url)`** — abre uma decisão e extrai os metadados formais (relator, órgão julgador, datas, número CNJ) + monta a `citacao_abnt` pronta para citar.
-
-Fluxo típico: buscar → escolher a ementa relevante → `ler_decisao` → colar a citação na peça.
+- **`buscar_jurisprudencia(query, limite, tribunal, tipo, periodo, ordenacao)`** — busca com filtros: tribunal (`STJ`, `STF`, `TJs`, `TRFs`…), tipo (`acordao`, `sumula`, `decisao`, `sentenca`, `despacho`), período (`7dias`/`30dias`/`365dias`) e ordenação (`data`/`relevancia`).
+- **`buscar_sumulas(query, limite, tribunal)`** — busca de súmulas.
+- **`ler_decisao(url)`** — metadados + **ementa** + `citacao_abnt` + `link_verificacao`.
+- **`ler_inteiro_teor(url)`** — **texto integral** do acórdão (relatório + voto + acórdão). Exige login.
+- **`compilar_dossie(urls, incluir_inteiro_teor, titulo, caminho)`** — reúne várias decisões/súmulas num único **`.docx`** (citação + ementa + link; inteiro teor opcional).
 
 ## Como funciona
 
-- Coleta via [**Scrapling**](https://github.com/D4Vinci/Scrapling) `StealthyFetcher` (headless, contorna o Cloudflare do site sem necessidade de login).
-- Parsing dos metadados a partir do JSON estruturado (`__NEXT_DATA__` / Apollo) embutido nas páginas — mais robusto que regex em HTML.
-- Citação por tribunal: formato convencional do STJ (recurso + registro + DJe) e formato genérico para TJs/TRFs/TST.
+- Coleta via [**Scrapling**](https://github.com/D4Vinci/Scrapling) `StealthyFetcher` — passa o Cloudflare em **headless puro** (sem janela).
+- **Login automático** com as suas credenciais (guardadas no Keychain do macOS), com sessão persistente. O login só é necessário para o inteiro teor e para desmascarar números/metadados; sem credenciais, opera anônimo (com dados parciais).
+- Parsing a partir do JSON estruturado (`__NEXT_DATA__` / Apollo) embutido nas páginas.
+- Citação por tribunal: formato convencional do STJ e genérico para TJs/TRFs/TST.
 
 ## Instalação
 
-Requer [uv](https://docs.astral.sh/uv/) e Python 3.12+.
+Requer [uv](https://docs.astral.sh/uv/) e Python 3.12+, com o Google Chrome instalado.
 
 ```bash
-git clone https://github.com/<seu-usuario>/mcp-jusbrasil.git
+git clone https://github.com/fxbarros/mcp-jusbrasil.git
 cd mcp-jusbrasil
 uv sync
-uv run scrapling install   # baixa o navegador usado pelo Scrapling
+uv run scrapling install        # navegador usado pelo Scrapling
+uv run python setup_credenciais.py   # grava e-mail/senha do JusBrasil no Keychain
 ```
 
-> O `StealthyFetcher` usa o Google Chrome instalado no sistema (`real_chrome=True`).
+As credenciais ficam **apenas no Keychain** (serviço `mcp-jusbrasil`) — nunca em arquivo.
 
 ## Uso no Claude Desktop
-
-Adicione ao `claude_desktop_config.json`:
 
 ```json
 {
@@ -45,16 +44,22 @@ Adicione ao `claude_desktop_config.json`:
 }
 ```
 
-### Variáveis de ambiente (opcionais)
-
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `JUSBRASIL_HEADLESS` | `true` | Roda sem janela. |
 | `JUSBRASIL_TIMEOUT_MS` | `60000` | Timeout por navegação (ms). |
+
+Roda **sempre headless** (sem janela).
+
+## Limitações
+
+- O filtro de **tribunal** é por sistema (`STJ`, `TJs`…), não por corte específica isolada (ex.: TJ-PI sozinho).
+- O filtro de **data** é por período relativo (últimos N dias), não por intervalo exato.
+- O **inteiro teor** nem sempre existe para toda decisão.
+- Os filtros dependem dos parâmetros atuais do site e podem quebrar se o JusBrasil mudar.
 
 ## Aviso
 
-O JusBrasil é um **agregador privado**, não é fonte oficial. Para citação formal em peça, confira sempre o texto no site oficial do tribunal (scon.stj.jus.br, sites dos TJs etc.). As tools incluem avisos anti-alucinação: campos não extraídos voltam nulos e **não devem ser preenchidos por inferência**. Respeite os termos de uso do site.
+O JusBrasil é um **agregador privado**, não é fonte oficial. Para citação formal, confira sempre o texto no site oficial do tribunal. As tools incluem avisos anti-alucinação: campos não extraídos voltam nulos e **não devem ser preenchidos por inferência**. Respeite os termos de uso do site.
 
 ## Licença
 
