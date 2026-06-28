@@ -13,7 +13,7 @@ Servidor [MCP](https://modelcontextprotocol.io) para pesquisar **jurisprudência
 ## Como funciona
 
 - Coleta via [**Scrapling**](https://github.com/D4Vinci/Scrapling) `StealthyFetcher` — passa o Cloudflare em **headless puro** (sem janela).
-- **Login automático** com as suas credenciais (guardadas no Keychain do macOS), com sessão persistente. O login só é necessário para o inteiro teor e para desmascarar números/metadados; sem credenciais, opera anônimo (com dados parciais).
+- **Login automático** com as suas credenciais (guardadas no cofre do sistema — Keychain no macOS, Gerenciador de Credenciais no Windows), com sessão persistente. O login só é necessário para o inteiro teor e para desmascarar números/metadados; sem credenciais, opera anônimo (com dados parciais).
 - Parsing a partir do JSON estruturado (`__NEXT_DATA__` / Apollo) embutido nas páginas.
 - Citação por tribunal: formato convencional do STJ e genérico para TJs/TRFs/TST.
 
@@ -29,7 +29,7 @@ uv run scrapling install        # navegador usado pelo Scrapling
 uv run python setup_credenciais.py   # grava e-mail/senha do JusBrasil no Keychain
 ```
 
-As credenciais ficam **apenas no Keychain** (serviço `mcp-jusbrasil`) — nunca em arquivo.
+As credenciais ficam **apenas no cofre de credenciais do sistema** (serviço `mcp-jusbrasil`) — nunca em arquivo. O `keyring` é multiplataforma e escolhe o cofre certo automaticamente: **Keychain** no macOS e **Gerenciador de Credenciais** no Windows (a dependência do backend do Windows é instalada pelo `uv sync`). O mesmo `setup_credenciais.py` serve para os dois.
 
 ## Uso no Claude Desktop
 
